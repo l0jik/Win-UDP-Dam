@@ -10,7 +10,9 @@ First Public Repository - be kind, therefore!
 
 ENG
 
-— ABOUT - 
+- ABOUT 
+
+
 The purpose of these scripts for Windows and Linux is to block
 UDP outgoing packets.
 Such a block creates a dam for spywares, thus interfering with 
@@ -34,7 +36,8 @@ Di comunicare via call, sia audio che video.
 E’ un progetto ancora in sviluppo, in un certo senso sperimentale. Ma, qualora
 siate mai stati spiati, è una soluzione piuttosto comoda.
 
-- DEPENDENCIES -
+- DEPENDENCIES
+
 
 python -m pip install psutil
 
@@ -45,6 +48,10 @@ py win-udp-dam.py status
 py win-udp-dam.py enable
 
 py win-udp-dam.py disable
+
+- ENABLE DNS
+
+py win-udp-dam.py enable --allow-dns
 
 
 
