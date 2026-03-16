@@ -35,13 +35,15 @@ Di comunicare via call, sia audio che video.
 E’ un progetto ancora in sviluppo, in un certo senso sperimentale. Ma, qualora
 siate mai stati spiati, è una soluzione piuttosto comoda.
 
-- USAGE -
+- DEPENDENCIES -
 
 python -m pip install psutil
 
-python win-udp-dam.py status
-python win-udp-dam.py enable
-python win-udp-dam.py disable
+- USAGE (Run Powershell as Administrator)-
+
+py win-udp-dam.py status
+py win-udp-dam.py enable
+py win-udp-dam.py disable
 
 
 
