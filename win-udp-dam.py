@@ -13,12 +13,17 @@ from pathlib import Path
 
 import psutil
 
-
 APP_NAME = "WinUdpDam"
-RULE_NAME = "WinUdpDam_Block_All_Outbound_UDP"
 BASE_DIR = Path.home() / "AppData" / "Local" / APP_NAME
 LOG_FILE = BASE_DIR / "win_udp_dam.log"
 STATE_FILE = BASE_DIR / "state.json"
+RULE_PREFIX = "WinUdpDam"
+RULE_NAME_BLOCK = f"{RULE_PREFIX}_Block_All_Outbound_UDP"
+RULE_NAME_BLOCK_EXCEPT_DNS = f"{RULE_PREFIX}_Block_All_Outbound_UDP_Except_DNS"
+RULE_NAME_ALLOW_PROGRAM_PREFIX = f"{RULE_PREFIX}_Allow_Outbound_UDP_"
+
+# Windows Firewall accepts comma-separated ports/ranges.
+BLOCK_PORTS_EXCEPT_DNS = "0-52,54-65535"
 
 
 def setup_logging() -> None:
@@ -50,7 +55,6 @@ def ensure_admin() -> None:
 
 
 def powershell_available() -> str:
-    # Prefer Windows PowerShell 5.1 on Windows 11 for NetSecurity module support
     for exe in ("powershell.exe", "pwsh.exe"):
         if shutil.which(exe):
             return exe
@@ -76,12 +80,7 @@ def run_ps(command: str, check: bool = True) -> subprocess.CompletedProcess:
         command,
     ]
     logging.info("PowerShell command: %s", command)
-    cp = subprocess.run(
-        full_cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    cp = subprocess.run(full_cmd, capture_output=True, text=True, encoding="utf-8")
 
     if cp.stdout.strip():
         logging.info("PowerShell stdout: %s", cp.stdout.strip())
@@ -90,8 +89,26 @@ def run_ps(command: str, check: bool = True) -> subprocess.CompletedProcess:
 
     if check and cp.returncode != 0:
         raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "PowerShell error")
-
     return cp
+
+
+def ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def normalize_program_paths(paths: list[str] | None) -> list[str]:
+    if not paths:
+        return []
+
+    normalized = []
+    seen = set()
+    for path in paths:
+        p = str(Path(path).expanduser())
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(p)
+    return normalized
 
 
 def collect_udp_ports_psutil() -> list[dict]:
@@ -120,13 +137,17 @@ def collect_udp_ports_psutil() -> list[dict]:
             "remote_ip": remote_ip,
             "remote_port": remote_port,
             "process_name": None,
+            "process_path": None,
         }
 
         if conn.pid:
             try:
-                item["process_name"] = psutil.Process(conn.pid).name()
+                proc = psutil.Process(conn.pid)
+                item["process_name"] = proc.name()
+                item["process_path"] = proc.exe()
             except Exception:
                 item["process_name"] = None
+                item["process_path"] = None
 
         key = (
             item["pid"],
@@ -134,6 +155,7 @@ def collect_udp_ports_psutil() -> list[dict]:
             item["local_port"],
             item["remote_ip"],
             item["remote_port"],
+            item["process_path"],
         )
         if key not in seen:
             seen.add(key)
@@ -147,32 +169,6 @@ def collect_udp_ports_psutil() -> list[dict]:
         )
     )
     return results
-
-
-def collect_udp_ports_powershell() -> list[dict]:
-    # Native Windows fallback/integration
-    ps = r"""
-$eps = Get-NetUDPEndpoint | Select-Object LocalAddress, LocalPort, OwningProcess
-$procs = @{}
-Get-Process | ForEach-Object { $procs[$_.Id] = $_.ProcessName }
-$eps | ForEach-Object {
-    [PSCustomObject]@{
-        local_ip = $_.LocalAddress
-        local_port = $_.LocalPort
-        pid = $_.OwningProcess
-        process_name = $procs[$_.OwningProcess]
-    }
-} | ConvertTo-Json -Depth 3
-"""
-    cp = run_ps(ps, check=True)
-    raw = cp.stdout.strip()
-    if not raw:
-        return []
-
-    data = json.loads(raw)
-    if isinstance(data, dict):
-        data = [data]
-    return data
 
 
 def save_state(data: dict) -> None:
@@ -189,60 +185,134 @@ def load_state() -> dict:
         return {}
 
 
-def firewall_rule_exists() -> bool:
+def firewall_rule_exists(display_name: str) -> bool:
     ps = f"""
-$rule = Get-NetFirewallRule -DisplayName "{RULE_NAME}" -ErrorAction SilentlyContinue
+$rule = Get-NetFirewallRule -DisplayName {ps_quote(display_name)} -ErrorAction SilentlyContinue
 if ($null -ne $rule) {{ "YES" }} else {{ "NO" }}
 """
     cp = run_ps(ps, check=True)
     return cp.stdout.strip() == "YES"
 
 
-def enable_block() -> None:
-    ensure_admin()
+def remove_rule_if_exists(display_name: str) -> None:
+    if firewall_rule_exists(display_name):
+        ps = f"Remove-NetFirewallRule -DisplayName {ps_quote(display_name)}"
+        run_ps(ps, check=True)
+        logging.info("Removed existing firewall rule: %s", display_name)
 
-    if firewall_rule_exists():
-        log_and_print(f"Rule already exists: {RULE_NAME}")
-        return
 
-    udp_before = collect_udp_ports_psutil()
-    state = {
-        "enabled_at": datetime.now().isoformat(timespec="seconds"),
-        "rule_name": RULE_NAME,
-        "udp_snapshot_before_enable": udp_before,
-    }
-    save_state(state)
-
+def get_all_winudpdam_rules() -> list[str]:
     ps = f"""
+Get-NetFirewallRule -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.DisplayName -like {ps_quote(RULE_PREFIX + '_*')} }} |
+  Select-Object -ExpandProperty DisplayName |
+  ConvertTo-Json -Depth 2
+"""
+    cp = run_ps(ps, check=True)
+    raw = cp.stdout.strip()
+    if not raw:
+        return []
+    data = json.loads(raw)
+    if isinstance(data, str):
+        data = [data]
+    return sorted(set(data))
+
+
+def create_block_rule(allow_dns: bool, exempt_programs: list[str]) -> None:
+    # Remove old block variants first.
+    remove_rule_if_exists(RULE_NAME_BLOCK)
+    remove_rule_if_exists(RULE_NAME_BLOCK_EXCEPT_DNS)
+
+    # Program-specific allow rules.
+    for program in exempt_programs:
+        allow_rule = f"{RULE_NAME_ALLOW_PROGRAM_PREFIX}{Path(program).name}"
+        remove_rule_if_exists(allow_rule)
+        ps_allow = f"""
 New-NetFirewallRule `
-  -DisplayName "{RULE_NAME}" `
+  -DisplayName {ps_quote(allow_rule)} `
+  -Direction Outbound `
+  -Action Allow `
+  -Protocol UDP `
+  -Program {ps_quote(program)} `
+  -Profile Any `
+  -Enabled True
+"""
+        run_ps(ps_allow, check=True)
+
+    if allow_dns:
+        # Important: do NOT create a broad block-all-UDP plus an allow-53 rule,
+        # because explicit block rules win. Instead block only non-53 UDP ports.
+        ps = f"""
+New-NetFirewallRule `
+  -DisplayName {ps_quote(RULE_NAME_BLOCK_EXCEPT_DNS)} `
+  -Direction Outbound `
+  -Action Block `
+  -Protocol UDP `
+  -RemotePort {BLOCK_PORTS_EXCEPT_DNS} `
+  -Profile Any `
+  -Enabled True
+"""
+    else:
+        ps = f"""
+New-NetFirewallRule `
+  -DisplayName {ps_quote(RULE_NAME_BLOCK)} `
   -Direction Outbound `
   -Action Block `
   -Protocol UDP `
   -Profile Any `
   -Enabled True
 """
+
     run_ps(ps, check=True)
-    log_and_print(f"Outbound UDP blocking enabled with rule: {RULE_NAME}")
+
+
+def enable_block(allow_dns: bool, exempt_programs: list[str]) -> None:
+    ensure_admin()
+
+    udp_before = collect_udp_ports_psutil()
+    state = {
+        "enabled_at": datetime.now().isoformat(timespec="seconds"),
+        "allow_dns": allow_dns,
+        "exempt_programs": exempt_programs,
+        "udp_snapshot_before_enable": udp_before,
+    }
+    save_state(state)
+
+    create_block_rule(allow_dns, exempt_programs)
+
+    log_and_print("Outbound UDP blocking enabled.")
+    if allow_dns:
+        log_and_print("UDP DNS on remote port 53 is NOT blocked.")
+        log_and_print("Note: DNS over TCP/53 or DoH/DoT may still depend on your system/app configuration.")
+    if exempt_programs:
+        log_and_print("Allowed UDP for these programs:")
+        for program in exempt_programs:
+            log_and_print(f"  - {program}")
 
 
 def disable_block() -> None:
     ensure_admin()
-
-    if not firewall_rule_exists():
-        log_and_print("No matching rule found.")
-        return
-
-    ps = f'Remove-NetFirewallRule -DisplayName "{RULE_NAME}"'
-    run_ps(ps, check=True)
-    log_and_print(f"Rule removed: {RULE_NAME}")
+    for rule in get_all_winudpdam_rules():
+        remove_rule_if_exists(rule)
+    log_and_print("WinUdpDam rules removed.")
 
 
 def status() -> None:
-    exists = firewall_rule_exists()
-    print(f"Firewall rule present: {'YES' if exists else 'NO'}")
+    state = load_state()
+    rules = get_all_winudpdam_rules()
 
-    print("\nUDP endpoints (psutil):")
+    print("WinUdpDam rules present:")
+    if not rules:
+        print("  none")
+    else:
+        for rule in rules:
+            print(f"  {rule}")
+
+    if state:
+        print("\nSaved state:")
+        print(json.dumps(state, indent=2, ensure_ascii=False))
+
+    print("\nUDP endpoints:")
     try:
         udp_eps = collect_udp_ports_psutil()
         if not udp_eps:
@@ -250,42 +320,34 @@ def status() -> None:
         else:
             for item in udp_eps:
                 print(
-                    f"  pid={item['pid']} "
-                    f"proc={item['process_name']} "
-                    f"{item['local_ip']}:{item['local_port']} "
-                    f"-> {item['remote_ip']}:{item['remote_port']}"
+                    f"  pid={item['pid']} proc={item['process_name']} "
+                    f"path={item['process_path']} "
+                    f"{item['local_ip']}:{item['local_port']} -> "
+                    f"{item['remote_ip']}:{item['remote_port']}"
                 )
     except Exception as e:
-        print(f"  psutil error: {e}")
+        print(f"  Error: {e}")
 
-    print("\nUDP endpoints (PowerShell/Get-NetUDPEndpoint):")
-    try:
-        udp_ps = collect_udp_ports_powershell()
-        if not udp_ps:
-            print("  No UDP endpoints detected.")
-        else:
-            for item in udp_ps:
-                print(
-                    f"  pid={item.get('pid')} "
-                    f"proc={item.get('process_name')} "
-                    f"{item.get('local_ip')}:{item.get('local_port')}"
-                )
-    except Exception as e:
-        print(f"  PowerShell error: {e}")
-
-    if STATE_FILE.exists():
-        print(f"\nState file: {STATE_FILE}")
-    print(f"Log file:   {LOG_FILE}")
+    print(f"\nLog file:   {LOG_FILE}")
+    print(f"State file: {STATE_FILE}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Block all outbound UDP on Windows 11 and log activity."
+        description="Block outbound UDP on Windows while optionally allowing DNS and specific programs."
+    )
+    parser.add_argument("command", choices=["enable", "disable", "status"], help="Action to perform")
+    parser.add_argument(
+        "--allow-dns",
+        action="store_true",
+        help="Do not block UDP traffic whose remote port is 53.",
     )
     parser.add_argument(
-        "command",
-        choices=["enable", "disable", "status"],
-        help="Action to perform",
+        "--allow-program",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Allow outbound UDP for a specific executable path. Can be used multiple times.",
     )
     return parser.parse_args()
 
@@ -295,10 +357,11 @@ def main() -> None:
     args = parse_args()
 
     log_and_print(f"Requested command: {args.command}")
+    exempt_programs = normalize_program_paths(args.allow_program)
 
     try:
         if args.command == "enable":
-            enable_block()
+            enable_block(allow_dns=args.allow_dns, exempt_programs=exempt_programs)
         elif args.command == "disable":
             disable_block()
         elif args.command == "status":
@@ -308,6 +371,9 @@ def main() -> None:
         log_and_print(f"Error: {e}", "error")
         sys.exit(1)
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
