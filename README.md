@@ -42,7 +42,9 @@ python -m pip install psutil
 - USAGE (Run Powershell as Administrator)-
 
 py win-udp-dam.py status
+
 py win-udp-dam.py enable
+
 py win-udp-dam.py disable
 
 
