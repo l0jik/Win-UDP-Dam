@@ -1,4 +1,4 @@
-# UDP-Neurofunk
+# WIN-UDP-Dam
 Outgoing UDP packets disturbance
 
 Win-UDP-Dam script v0.1
