@@ -23,6 +23,7 @@ communicate through live calls, both audio and video.
 
 It’s still an ongoing project, experimental in a way. But, had you ever been spied upon,
 It comes quite handy as a solution.
+TO NAVIGATE, remember to enable DNS!
 
 IT
 
@@ -35,6 +36,7 @@ Di comunicare via call, sia audio che video.
 
 E’ un progetto ancora in sviluppo, in un certo senso sperimentale. Ma, qualora
 siate mai stati spiati, è una soluzione piuttosto comoda.
+PER NAVIGARE, ricorda di abilitare il DNS!
 
 - DEPENDENCIES
 
